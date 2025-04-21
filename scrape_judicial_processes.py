@@ -1,3 +1,6 @@
+from enum import Enum
+from dataclasses import dataclass
+from typing import Optional, List, Dict
 import time
 import json
 import os
@@ -8,38 +11,65 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import Select
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler("scraper.log"),
         logging.StreamHandler()
     ]
 )
 
-class JudicialProcessScraper:
-    """
-    A class to scrape information from the Colombian judicial processes website
-    by iterating through all possible combinations of search parameters.
-    """
+class SelectionLevel(Enum):
+    DEPARTMENT = ("list-83", "department")
+    CITY = ("list-89", "city")
+    ENTITY = ("list-95", "entity")
+    SPECIALTY = ("list-101", "specialty")
+    OFFICE = ("list-107", "office")
+
+    def __init__(self, list_id: str, level_name: str):
+        self.list_id = list_id
+        self.level_name = level_name
+
+@dataclass
+class SelectionState:
+    """Class to maintain the current state of selections"""
+    department: Optional[str] = None
+    city: Optional[str] = None
+    entity: Optional[str] = None
+    specialty: Optional[str] = None
+    office: Optional[str] = None
+    department_index: Optional[int] = None
+    city_index: Optional[int] = None
+    entity_index: Optional[int] = None
+    specialty_index: Optional[int] = None
+    office_index: Optional[int] = None
     
-    def __init__(self, search_name, headless=False):
-        """
-        Initialize the scraper with the search name and browser settings
+    def reset_from_level(self, level: SelectionLevel):
+        """Reset all selections from the given level onwards"""
+        levels = list(SelectionLevel)
+        start_idx = levels.index(level)
         
-        Args:
-            search_name (str): The name to search for
-            headless (bool): Whether to run the browser in headless mode
-        """
+        for lvl in levels[start_idx:]:
+            setattr(self, lvl.level_name, None)
+            setattr(self, f"{lvl.level_name}_index", None)
+
+class JudicialProcessScraper:
+    def __init__(self, search_name, target_department: Optional[str] =None, headless=False):
         self.url = "https://consultaprocesos.ramajudicial.gov.co/Procesos/NombreRazonSocial"
         self.search_name = search_name
+        self.target_department = target_department
         self.results = []
+        self.selection_state = SelectionState()
         
-        # Configure Chrome options
+        # Initialize Chrome
+        self._setup_chrome(headless)
+        
+    def _setup_chrome(self, headless):
+        """Set up Chrome driver with appropriate options"""
         chrome_options = Options()
         if headless:
             chrome_options.add_argument("--headless")
@@ -49,603 +79,367 @@ class JudicialProcessScraper:
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
         
-        # Initialize the WebDriver with proper error handling
         try:
-            logging.info("Initializing Chrome WebDriver...")
+            driver_path = os.path.abspath("chromedriver-win64/chromedriver.exe")
+            if not os.path.exists(driver_path):
+                raise FileNotFoundError(f"ChromeDriver not found at {driver_path}")
             
-            try:
-                # Use the local ChromeDriver in the chromedriver-win64 directory
-                driver_path = os.path.abspath("chromedriver-win64/chromedriver.exe")
-                
-                # Verify that the driver exists before trying to use it
-                if not os.path.exists(driver_path):
-                    raise FileNotFoundError(f"ChromeDriver not found at {driver_path}")
-                
-                logging.info(f"Using ChromeDriver at: {driver_path}")
-                
-                # Initialize the WebDriver with the service
-                service = Service(driver_path)
-                self.driver = webdriver.Chrome(service=service, options=chrome_options)
-                
-            except Exception as err:
-                logging.error(f"ChromeDriver initialization failed: {err}")
-                raise
-            # Set up wait mechanism with longer timeout
+            service = Service(driver_path)
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
             self.wait = WebDriverWait(self.driver, 30)
-            self.short_wait = WebDriverWait(self.driver, 5)  # For quick checks
-            logging.info("Chrome WebDriver initialized successfully")
+            self.short_wait = WebDriverWait(self.driver, 5)
             
         except Exception as e:
             logging.error(f"Failed to initialize Chrome WebDriver: {e}")
-            print("\nChrome WebDriver initialization failed. Please ensure:")
-            print("1. Chrome browser is installed and up to date")
-            print("2. You have proper permissions to execute programs")
-            print("3. Your antivirus is not blocking WebDriver")
             raise
-    
-    def __del__(self):
-        """Clean up resources by closing the browser when done"""
-        if hasattr(self, 'driver'):
-            try:
-                logging.info("Closing Chrome WebDriver...")
-                self.driver.quit()
-                logging.info("Chrome WebDriver closed successfully")
-            except Exception as e:
-                logging.error(f"Error closing Chrome WebDriver: {e}")
-    
-    def initialize_search_form(self, max_retries=1):
-        """Navigate to the search page and set initial form values with retries"""
-        retry_count = 0
-        while retry_count < max_retries:
-            try:
-                logging.info(f"Navigating to URL: {self.url} (Attempt {retry_count + 1}/{max_retries})")
-                self.driver.get(self.url)
-                
-                # Wait for the page to load with multiple conditions
-                logging.info("Waiting for page to fully load...")
-                
-                # First wait for document ready state
-                self.wait.until(lambda d: d.execute_script('return document.readyState') == 'complete')
-                logging.info("Document ready state complete")
-                
-                # Then wait for jQuery to be loaded and active (if present)
-                jquery_ready = """
-                    return (typeof jQuery !== 'undefined') ? 
-                        jQuery.active === 0 : true;
-                """
-                try:
-                    self.short_wait.until(lambda d: d.execute_script(jquery_ready))
-                    logging.info("jQuery ready state complete")
-                except:
-                    logging.info("jQuery not detected on page, continuing")
-                
-                # Additional wait time for any asynchronous content
-                #time.sleep(1)
-                
-                # Try multiple selector strategies for the radio button
-                logging.info("Selecting 'Todos los procesos (consulta completa, menos rápida)'...")
-                radio_selectors = [
-                    # New selector format with aria-checked attribute
-                    (By.XPATH, "//label[@for='input-67']")
-                ]
-                radio_todos = None
-                for selector in radio_selectors:
+
+    def _initialize_form(self):
+        """Initialize the search form with initial values"""
+        try:
+            # Wait for page load
+            self.wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+            
+            # Select "Todos los procesos" radio button
+            radio = self.wait.until(EC.element_to_be_clickable((By.XPATH, "//label[@for='input-67']")))
+            radio.click()
+            
+            # Set "Tipo Persona" to "Natural"
+            tipo_persona = self.wait.until(EC.element_to_be_clickable(
+                (By.XPATH, "//div[@role='button' and @aria-haspopup='listbox' and @aria-owns='list-72']")
+            ))
+            tipo_persona.click()
+            
+            natural_option = self.wait.until(EC.element_to_be_clickable(
+                (By.XPATH, "//div[contains(@class, 'v-list-item')][.//div[contains(@class, 'v-list-item__title') and normalize-space()='Natural']]")
+            ))
+            natural_option.click()
+            
+            # Fill name field
+            nombre_input = self.wait.until(EC.presence_of_element_located((By.ID, "input-78")))
+            nombre_input.clear()
+            nombre_input.send_keys(self.search_name)
+            
+        except Exception as e:
+            logging.error(f"Error initializing form: {e}")
+            raise
+
+    def _find_and_select_target_department(self) -> Optional[int]:
+        """
+        Finds the index of the target department, selects it, and returns the index.
+        Returns None if the department is not found or an error occurs.
+        """
+        if not self.target_department:
+            return None # Should not be called if no target is set, but safe check
+
+        level = SelectionLevel.DEPARTMENT
+        target_name_upper = self.target_department.strip().upper()
+        logging.info(f"Attempting to find and select target department: {target_name_upper}")
+
+        try:
+            # Click dropdown to open it
+            button_xpath = f"//div[@role='button' and @aria-haspopup='listbox' and @aria-expanded='false' and @aria-owns='{level.list_id}']"
+            dropdown = self.wait.until(EC.element_to_be_clickable((By.XPATH, button_xpath)))
+            self.driver.execute_script("arguments[0].click();", dropdown)
+
+            # Wait for list to be visible
+            option_list = self.wait.until(EC.visibility_of_element_located((By.ID, level.list_id)))
+            options = option_list.find_elements(By.CSS_SELECTOR, ".v-list-item__title")
+
+            found_index = -1
+            for index, option in enumerate(options):
+                option_text = option.text.strip().upper()
+                if option_text == target_name_upper:
+                    logging.info(f"Found target department '{target_name_upper}' at index {index}.")
+                    # Select the option
+                    self.short_wait.until(EC.visibility_of(option))
+                    self.short_wait.until(EC.element_to_be_clickable(option))
+                    self.driver.execute_script("arguments[0].click();", option)
+
+                    # Update state
+                    setattr(self.selection_state, level.level_name, option.text) # Use original case text
+                    setattr(self.selection_state, f"{level.level_name}_index", index)
+                    logging.info(f"Selected {level.level_name}: {option.text} (Index: {index}) (Pending: {len(options) - index - 1})")
+
+                    # Wait for dropdown to close
                     try:
-                        logging.info(f"Trying selector: {selector}")
-                        radio_todos = self.wait.until(EC.element_to_be_clickable(selector))
-                        if radio_todos:
-                            break
-                    except Exception as e:
-                        logging.warning(f"Selector {selector} failed: {e}")
-                
-                if not radio_todos:
-                    raise NoSuchElementException("Could not find radio button with any selector")
-                
-                try:
-                    radio_todos.click()
-                except Exception as click_error:
-                    logging.warning(f"Standard click failed: {click_error}")
-                                   
-                logging.info("Radio button selected successfully")
+                        self.short_wait.until(EC.invisibility_of_element_located((By.ID, level.list_id)))
+                    except TimeoutException:
+                        logging.warning(f"Dropdown list {level.list_id} did not become invisible after selection.")
 
-                # Set the "Tipo Persona" select to "Natural" with better error handling
-                logging.info("Setting 'Tipo Persona' to 'Natural'...")
-                try:
-                    # Wait for the select element to be present
-                    logging.info("Opened 'Tipo Persona' dropdown...")
-                    button_tipo_persona_element = self.wait.until(
-                        EC.element_to_be_clickable((By.XPATH, "//div[@role='button' and @aria-haspopup='listbox' and @aria-expanded='false' and @aria-owns='list-72']"))
-                    )
-                    button_tipo_persona_element.click()
-                    #time.sleep(1)  # Wait for the dropdown to open
-                    logging.info("Selecting 'Natural' from dropdown...")
-                    tipo_persona_element = self.wait.until(
-                        EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'v-list-item')][.//div[contains(@class, 'v-list-item__title') and normalize-space()='Natural']]"))
-                    )
-                    
-                    tipo_persona_element.click()
-                    logging.info("Tipo Persona set successfully")
-                except Exception as e:
-                    logging.error(f"Error setting Tipo Persona: {e}")
-                    # Take a screenshot for debugging
-                    screenshot_path = f"error_screen_{int(time.time())}.png"
-                    self.driver.save_screenshot(screenshot_path)
-                    logging.info(f"Screenshot saved to {screenshot_path}")
-                    raise
-                
-                # Fill the name field with better error handling
-                logging.info(f"Filling name field with: {self.search_name}")
-                try:
-                    nombre_input = self.wait.until(
-                        EC.presence_of_element_located((By.ID, "input-78"))
-                    )
-                    nombre_input.clear()
-                    nombre_input.send_keys(self.search_name)
-                    logging.info("Name field filled successfully")
-                    
-                    # Successfully initialized the form, return from the function
-                    return
-                except Exception as e:
-                    logging.error(f"Error filling name field: {e}")
-                    # Take a screenshot for debugging
-                    screenshot_path = f"error_screen_{int(time.time())}.png"
-                    self.driver.save_screenshot(screenshot_path)
-                    logging.info(f"Screenshot saved to {screenshot_path}")
-                    raise
-                    
-            except Exception as e:
-                logging.error(f"Error initializing search form: {e}")
-            
-            # If we got here, there was an error, increment retry counter and try again
-            retry_count += 1
-            logging.warning(f"Retrying form initialization (attempt {retry_count + 1}/{max_retries})")
-            #time.sleep(5)  # Wait before retrying
-            
-        # If we exhausted all retries, raise an exception
-        raise Exception(f"Failed to initialize search form after {max_retries} attempts")
-        
-    def handle_select_chain(self, department_index=1, city_index=1, entity_index=1, 
-                            specialty_index=1, office_index=1, max_retries=3):
-        """
-        Handle the chain of dependent select fields with backtracking
-        
-        This method implements the backtracking algorithm to try all combinations
-        of the select fields in the form.
-        """
-        # Select Department (Departamento)
-        # Select Department (Departamento) with retry logic
-        for retry in range(max_retries):
-            try:
-                # Wait for both presence and interactability
-                dept_element = self.wait.until(
-                    EC.element_to_be_clickable((By.XPATH, "//div[@role='button' and @aria-haspopup='listbox' and @aria-expanded='false' and @aria-owns='list-83']"))
-                )
-                dept_element.click()
-                #time.sleep(1)  # Wait for the dropdown to open
-                departmentList = self.wait.until(EC.visibility_of_element_located((By.ID, "list-83")))
-                break
-            except (TimeoutException, StaleElementReferenceException) as e:
-                if retry == max_retries - 1:
-                    logging.error(f"Failed to select department after {max_retries} attempts: {e}")
-                    raise
-                logging.warning(f"Attempt {retry+1}/{max_retries} failed to select department: {e}")
-                # Take a screenshot for debugging
-                self.driver.save_screenshot(f"dept_select_error_{retry}.png")
-                # Refresh the page and reinitialize form if needed
-                if retry > 0:
-                    self.driver.refresh()
-                    #time.sleep(3)
-                    # Wait for document ready state
-                    self.wait.until(lambda d: d.execute_script('return document.readyState') == 'complete')
-        
-        # Get all department options
-        try:
-            logging.info("Getting department options...")
-            departments = departmentList.find_elements(By.CSS_SELECTOR, ".v-list-item__title")
-            logging.info(f"Found {len(departments)-1} departments")
-        except Exception as e:
-            logging.error(f"Error getting department options: {e}")
-            departments = []
-            
-        if len(departments) <= 1:
-            logging.warning("No department options found, cannot proceed")
-            return
-            
-        if department_index >= len(departments):
-            logging.info("All departments processed")
-            return  # All departments processed
-        
-        try:
-            department_element_to_click = departments[department_index]
-            department_element_to_click.click()
-            
-            selected_dept_text = department_element_to_click.text
-            
-            logging.info(f"Selected Department: {department_index} - {selected_dept_text}")
-            #time.sleep(1)
-        except Exception as e:
-            logging.error(f"Error selecting department {department_index}: {e}")
-            # Try to recover by moving to the next department
-            self.handle_select_chain(department_index + 1, city_index, entity_index, specialty_index, office_index)
-            return
-        
-        # Select City (Ciudad)
-        # Select City (Ciudad) with retry logic
-        for retry in range(max_retries):
-            try:
-                # Make sure the city dropdown has loaded after department selection
-                city_element = self.wait.until(
-                    EC.element_to_be_clickable((By.XPATH, "//div[@role='button' and @aria-haspopup='listbox' and @aria-expanded='false' and @aria-owns='list-89']"))
-                )
-                city_element.click()
-                #time.sleep(2)  # Wait for the dropdown to open
-                cityList = self.wait.until(EC.visibility_of_element_located((By.ID, "list-89")))
-                break
-            except (TimeoutException, StaleElementReferenceException) as e:
-                if retry == max_retries - 1:
-                    logging.error(f"Failed to select city after {max_retries} attempts: {e}")
-                    raise
-                logging.warning(f"Attempt {retry+1}/{max_retries} failed to select city: {e}")
-                #time.sleep(2)
-        
-        # Get all city options for the selected department
-        try:
-            logging.info("Getting city options...")
-            cities = cityList.find_elements(By.CSS_SELECTOR, ".v-list-item__title")
-            logging.info(f"Found {len(cities)-1} cities for department {selected_dept_text}")
-        except Exception as e:
-            logging.error(f"Error getting city options: {e}")
-            cities = []
-            
-        if len(cities) <= 1:
-            logging.warning(f"No city options found for department {selected_dept_text}, moving to next department")
-            self.handle_select_chain(department_index + 1, city_index, entity_index, specialty_index, office_index)
-            return
-            
-        if city_index >= len(cities):
-            logging.info(f"All cities processed for department {selected_dept_text}")
-            # Move to next department
-            self.handle_select_chain(department_index + 1, 1, 1, 1, 1)
-            return
-        
-        try:
-            city_element_to_click = cities[city_index]
-            city_element_to_click.click()
-            
-            selected_city_text = city_element_to_click.text
-            
-            logging.info(f"Selected City: {city_index} - {selected_city_text}")
-            #time.sleep(1)
-        except Exception as e:
-            logging.error(f"Error selecting city {city_index}: {e}")
-            # Try to recover by moving to the next city
-            self.handle_select_chain(department_index, city_index + 1, 1, 1, 1)
-            return
-        # Select Entity (Entidad)
-        # Select Entity (Entidad) with retry logic
-        for retry in range(max_retries):
-            try:
-                # Wait for entity dropdown to be interactive
-                entity_element = self.wait.until(
-                    EC.element_to_be_clickable((By.XPATH, "//div[@role='button' and @aria-haspopup='listbox' and @aria-expanded='false' and @aria-owns='list-95']"))
-                )
-                entity_element.click()
-                #time.sleep(1)  # Wait for the dropdown to open
-                entityList = self.wait.until(EC.visibility_of_element_located((By.ID, "list-95")))
-                break
-            except (TimeoutException, StaleElementReferenceException) as e:
-                if retry == max_retries - 1:
-                    logging.error(f"Failed to select entity after {max_retries} attempts: {e}")
-                    raise
-                logging.warning(f"Attempt {retry+1}/{max_retries} failed to select entity: {e}")
-                #time.sleep(2)
-        
-        # Get all entity options for the selected city
-        try:
-            logging.info("Getting entity options...")
-            entities = entityList.find_elements(By.CSS_SELECTOR, ".v-list-item__title")
-            logging.info(f"Found {len(entities)-1} entities for city {selected_city_text}")
-        except Exception as e:
-            logging.error(f"Error getting entity options: {e}")
-            entities = []
-            
-        if len(entities) <= 1:
-            logging.warning(f"No entity options found for city {selected_city_text}, moving to next city")
-            self.handle_select_chain(department_index, city_index + 1, 1, 1, 1)
-            return
-            
-        if entity_index >= len(entities):
-            logging.info(f"All entities processed for city {selected_city_text}")
-            # Move to next city
-            self.handle_select_chain(department_index, city_index + 1, 1, 1, 1)
-            return
-        
-        try:
-            entity_element_to_click = entities[entity_index]
-            entity_element_to_click.click()
-            
-            selected_entity_text = entity_element_to_click.text            
-            
-            logging.info(f"Selected Entity: {entity_index} - {selected_entity_text}")
-            #time.sleep(1)
-        except Exception as e:
-            logging.error(f"Error selecting entity {entity_index}: {e}")
-            # Try to recover by moving to the next entity
-            self.handle_select_chain(department_index, city_index, entity_index + 1, 1, 1)
-            return
-        
-        #time.sleep(1)
-        
-        # Select Specialty (Especialidad)
-        # Select Specialty (Especialidad) with retry logic
-        for retry in range(max_retries):
-            try:
-                # Wait for specialty dropdown to be interactive
-                specialty_element = self.wait.until(
-                    EC.element_to_be_clickable((By.XPATH, "//div[@role='button' and @aria-haspopup='listbox' and @aria-expanded='false' and @aria-owns='list-101']"))
-                )
-                specialty_element.click()
-                #time.sleep(1)  # Wait for the dropdown to open
-                specialtyList = self.wait.until(EC.visibility_of_element_located((By.ID, "list-101")))
-                break
-            except (TimeoutException, StaleElementReferenceException) as e:
-                if retry == max_retries - 1:
-                    logging.error(f"Failed to select specialty after {max_retries} attempts: {e}")
-                    raise
-                logging.warning(f"Attempt {retry+1}/{max_retries} failed to select specialty: {e}")
-                #time.sleep(2)
+                    found_index = index
+                    break # Exit loop once found and selected
 
-        # Get all specialty options for the selected entity
-        try:
-            logging.info("Getting specialty options...")
-            specialties = specialtyList.find_elements(By.CSS_SELECTOR, ".v-list-item__title")
-            logging.info(f"Found {len(specialties)-1} specialties for entity {selected_entity_text}")
+            if found_index == -1:
+                logging.error(f"Target department '{target_name_upper}' not found in the list.")
+                # Close dropdown if still open
+                try:
+                    if dropdown.get_attribute("aria-expanded") == "true":
+                         self.driver.execute_script("arguments[0].click();", dropdown) # Click again to close
+                except: # Ignore errors trying to close
+                    pass
+                return None
+
+            return found_index
+
         except Exception as e:
-            logging.error(f"Error getting specialty options: {e}")
-            specialties = []
-            
-        if len(specialties) <= 1:
-            logging.warning(f"No specialty options found for entity {selected_entity_text}, moving to next entity")
-            self.handle_select_chain(department_index, city_index, entity_index + 1, 1, 1)
-            return
-            
-        if specialty_index >= len(specialties):
-            logging.info(f"All specialties processed for entity {selected_entity_text}")
-            # Move to next entity
-            self.handle_select_chain(department_index, city_index, entity_index + 1, 1, 1)
-            return
-        
-        try:
-            specialty_element_to_click = specialties[specialty_index]
-            specialty_element_to_click.click()
-            
-            selected_specialty_text = specialty_element_to_click.text
-            
-            logging.info(f"Selected Specialty: {specialty_index} - {selected_specialty_text}")
-            #time.sleep(1)
-        except Exception as e:
-            logging.error(f"Error selecting specialty {specialty_index}: {e}")
-            # Try to recover by moving to the next specialty
-            self.handle_select_chain(department_index, city_index, entity_index, specialty_index + 1, 1)
-            return
-        
-        #time.sleep(1)
-        
-        # Select Office (Despacho)
-        # Select Office (Despacho) with retry logic
-        for retry in range(max_retries):
-            try:
-                # Wait for office dropdown to be interactive
-                office_element = self.wait.until(
-                    EC.element_to_be_clickable((By.XPATH, "//div[@role='button' and @aria-haspopup='listbox' and @aria-expanded='false' and @aria-owns='list-107']"))
-                )
-                office_element.click()
-                #time.sleep(1)  # Wait for the dropdown to open
-                officeList = self.wait.until(EC.visibility_of_element_located((By.ID, "list-107")))
-                break
-            except (TimeoutException, StaleElementReferenceException) as e:
-                if retry == max_retries - 1:
-                    logging.error(f"Failed to select office after {max_retries} attempts: {e}")
-                    raise
-                logging.warning(f"Attempt {retry+1}/{max_retries} failed to select office: {e}")
-                #time.sleep(2)
-        
-        # Get all office options for the selected specialty
-        try:
-            logging.info("Getting office options...")
-            offices = officeList.find_elements(By.CSS_SELECTOR, ".v-list-item__title")
-            logging.info(f"Found {len(offices)-1} offices for specialty {selected_specialty_text}")
-        except Exception as e:
-            logging.error(f"Error getting office options: {e}")
-            offices = []
-            
-        if len(offices) <= 1:
-            logging.warning(f"No office options found for specialty {selected_specialty_text}, moving to next specialty")
-            self.handle_select_chain(department_index, city_index, entity_index, specialty_index + 1, 1)
-            return
-            
-        if office_index >= len(offices):
-            logging.info(f"All offices processed for specialty {selected_specialty_text}")
-            # Move to next specialty
-            self.handle_select_chain(department_index, city_index, entity_index, specialty_index + 1, 1)
-            return
-        
-        try:
-            office_element_to_click = offices[office_index]
-            office_element_to_click.click()
-            
-            selected_office_text = office_element_to_click.text
-            
-            logging.info(f"Selected Office: {office_index} - {selected_office_text}")
-            #time.sleep(1)
-        except Exception as e:
-            logging.error(f"Error selecting office {office_index}: {e}")
-            # Try to recover by moving to the next office
-            self.handle_select_chain(department_index, city_index, entity_index, specialty_index, office_index + 1)
-            return
-        
-        # Click the search button
-        # Click the search button with retry logic
-        for retry in range(max_retries):
-            try:
-                search_button = self.wait.until(
-                    EC.element_to_be_clickable((By.XPATH, "//button[@type='button' and @aria-label= 'Consultar por nombre o razón social']"))
-                )
-                search_button.click()
-                break
-            except (TimeoutException, StaleElementReferenceException) as e:
-                if retry == max_retries - 1:
-                    logging.error(f"Failed to click search button after {max_retries} attempts: {e}")
-                    raise
-                logging.warning(f"Attempt {retry+1}/{max_retries} failed to click search button: {e}")
-                #time.sleep(2)
-        # Wait for results
-        time.sleep(5)
-        
-        # Handle search results
-        self.handle_search_results({
-            'department': selected_dept_text,
-            'city': selected_city_text,
-            'entity': selected_entity_text,
-            'specialty': selected_specialty_text,
-            'office': selected_office_text
-        })
-        
-        # Move to next office
-        self.handle_select_chain(department_index, city_index, entity_index, specialty_index, office_index + 1)
+            logging.error(f"Error finding or selecting target department '{target_name_upper}': {e}", exc_info=True)
+            return None
+      
     
-    def handle_search_results(self, search_params):
+    def _select_dropdown_option(self, level: SelectionLevel, option_index: int) -> bool:
         """
-        Handle search results - save successful searches, handle no results case
-        
-        Args:
-            search_params (dict): Dictionary containing the combination of search parameters
+        Select an option from a dropdown at the specified level
+        Returns True if selection was successful
         """
         try:
-            # Check if no results message is present
-            time.sleep(3)
-            modal_dialog = self.wait.until(EC.visibility_of_element_located((By.XPATH, "//div[@role='dialog' and @aria-modal='true' and contains(@class, 'v-dialog__content--active')]")))
-            no_results_message = "La consulta no generó resultados, por favor revisar las opciones ingresadas e intentarlo nuevamente."
+            # Click dropdown to open it
+            button_xpath = f"//div[@role='button' and @aria-haspopup='listbox' and @aria-expanded='false' and @aria-owns='{level.list_id}']"
+            dropdown = self.wait.until(EC.element_to_be_clickable((By.XPATH, button_xpath)))
+            self.driver.execute_script("arguments[0].click();", dropdown)
+            #dropdown.click()
             
-            if(not modal_dialog.is_displayed()):
-                logging.info("Error showing the result of the search")
-                return    
+            # Wait for list to be visible
+            option_list = self.wait.until(EC.visibility_of_element_located((By.ID, level.list_id)))
+            options = option_list.find_elements(By.CSS_SELECTOR, ".v-list-item__title")
             
+            if len(options) <= 1 or option_index >= len(options):
+                logging.info(f"No more options at {level.level_name} level")
+                setattr(self.selection_state, level.level_name, None)
+                setattr(self.selection_state, f"{level.level_name}_index", None)
+                return False
+                
+            # Select the option
+            option = options[option_index]
+            option_text = option.text
+            self.short_wait.until(EC.visibility_of(option))
+            self.short_wait.until(EC.element_to_be_clickable(option))
+            self.driver.execute_script("arguments[0].click();", option)
+            #option.click()
             
-            #modal_alert = modal_dialog.find_element(By.XPATH, "//div[@class='v-alert__content']")
-            modal_message = modal_dialog.find_element(By.XPATH, "//p[@class='pl-1']")
-            text_result = modal_message.text.strip()   
-            logging.info(f"Modal message: {text_result}")             
+            # Update state
+            setattr(self.selection_state, level.level_name, option_text)
+            setattr(self.selection_state, f"{level.level_name}_index", option_index)
+            logging.info(f"Selected {level.level_name}: {option_text} (Index: {option_index}) (Pending: {len(options) - option_index - 1})")
             
+            try:
+                self.short_wait.until(EC.invisibility_of_element_located((By.ID, level.list_id)))
+            except TimeoutException:
+                logging.warning(f"Dropdown list {level.list_id} did not become invisible after selection.")
+                # Might need a different wait strategy if invisibility isn't reliable
             
-            if no_results_message in text_result:
-                print("        No results found, trying next combination")
-                # Click the "Volver" button
-                back_button = self.driver.find_element(By.XPATH, "//button[@type='button' and @class='v-btn v-btn--is-elevated v-btn--has-bg theme--dark v-size--default leading']")
-                back_button.click()
-                time.sleep(2)
-                return
+            return True
+        
+        except StaleElementReferenceException:
+            logging.warning(f"Stale element reference encountered while selecting {level.level_name} index {option_index}. Retrying might be needed or adjust waits.")
+            return False # Indicate failure on stale element
+        except Exception as e:
+            logging.error(f"Error selecting {level.level_name}: {e}")
+            return False
+
+    def _navigate_selection_chain(self, level: SelectionLevel, index: int = 1) -> None:
+        """
+        Navigate through the selection chain with smart backtracking
+        """
+        logging.debug(f"Navigating level: {level.level_name}, attempting index: {index}") # Add debug logging
+        
+        if not self._select_dropdown_option(level, index):
+            # No more options at this level, go back one level
+            prev_levels = list(SelectionLevel)
+            current_idx = prev_levels.index(level)
             
-            # If we get here, we have results
-            print("        Found results!")
+            if current_idx > 0:
+                prev_level = prev_levels[current_idx - 1]
+                
+                prev_index = getattr(self.selection_state, f"{prev_level.level_name}_index", 1)
+                logging.debug(f"Backtracking from {level.level_name} to {prev_level.level_name}. Previous index was {prev_index}. Trying next: {prev_index + 1}")
+                
+                self.selection_state.reset_from_level(prev_level)
+                self._navigate_selection_chain(prev_level, prev_index + 1)
+            else:
+                # We are at the first level (DEPARTMENT) and ran out of options
+                logging.info("Finished processing all departments.")
             
-            # Extract results table
-            results_table = self.wait.until(
-                EC.presence_of_element_located((By.ID, "ResultadoConsulta"))
+            return
+            
+        # Successfully selected at this level, move to next level
+        next_levels = list(SelectionLevel)
+        current_idx = next_levels.index(level)
+        
+        if current_idx < len(next_levels) - 1:
+            next_level = next_levels[current_idx + 1]
+            logging.debug(f"Moving to next level: {next_level.level_name}")
+            self._navigate_selection_chain(next_level, 1)
+        else:
+            # We've reached the end of the chain, perform search
+            logging.debug(f"Reached end of chain ({level.level_name} index {index}). Performing search.")
+            self._perform_search()
+            # Try next option at current level
+            logging.debug(f"Search complete for {level.level_name} index {index}. Trying next index: {index + 1}")
+            self._navigate_selection_chain(level, index + 1)
+
+    def _perform_search(self) -> None:
+        """
+        Perform the search with current selections and handle results
+        """
+        try:
+            search_button = self.wait.until(
+                EC.element_to_be_clickable((By.XPATH, "//button[@type='button' and @aria-label='Consultar por nombre o razón social']"))
             )
+            search_button.click()
             
-            rows = results_table.find_elements(By.TAG_NAME, "tr")
-            table_data = []
+            #time.sleep(5)  # Wait for results
             
-            for row in rows[1:]:  # Skip header row
+            # Handle results...
+            self._handle_search_results({
+                level.level_name: getattr(self.selection_state, level.level_name)
+                for level in SelectionLevel
+            })
+            
+        except Exception as e:
+            logging.error(f"Error performing search: {e}")
+
+    def _handle_search_results(self, search_params: Dict[str, str]) -> None:
+        """Handle the search results and save them"""
+        try:
+            modal = self.wait.until(EC.visibility_of_element_located(
+                (By.XPATH, "//div[@role='dialog' and @aria-modal='true' and @class='v-dialog__content v-dialog__content--active']")
+            ))
+            
+            message = modal.find_element(By.XPATH, "//p[@class='pl-1']").text.strip()
+            
+            if "no generó resultados" in message:
+                logging.info("No results found")
+                self._click_back_button()
+                return
+                
+            # Process results...
+            self._extract_and_save_results(search_params)
+            self._click_back_button()
+        
+        except TimeoutException:
+            # Specific handling for when the modal doesn't appear in time
+            logging.error("Timeout waiting for results modal or its content.")
+            self._recover_from_error()
+        except NoSuchElementException:
+            # Handle case where the modal or its content is not found
+            logging.error("Modal or its content not found in the DOM.")
+            try:
+                self._click_back_button()
+            except Exception as back_err:
+                logging.error(f"Failed to click back button after NoSuchElementException: {back_err}")
+                self._recover_from_error()
+        except Exception as e:
+            logging.error(f"Unexpected error handling results: {e}")
+            self._recover_from_error()
+
+    def _click_back_button(self):
+        """Click the back button after viewing results"""
+        try:
+            back_button_xpath = "//button[@type='button' and contains(@class, 'v-btn v-btn--is-elevated v-btn--has-bg theme--dark v-size--default leading')]"
+            back_button = self.wait.until(EC.element_to_be_clickable(
+                (By.XPATH, back_button_xpath)
+            ))
+            self.driver.execute_script("arguments[0].click();", back_button)
+            #back_button.click()
+            
+            try:
+                modal_xpath = "//div[@role='dialog' and @aria-modal='true' and @class='v-dialog__content v-dialog__content--active']"
+                self.wait.until(EC.invisibility_of_element_located((By.XPATH, modal_xpath)))
+                logging.debug("Modal dialog became invisible after clicking back.")
+            except TimeoutException:
+                logging.warning("Modal dialog did not become invisible after clicking back.")
+            
+        except TimeoutException:
+            logging.error("Timeout waiting for the back button to become clickable.")
+            # Consider recovery if the back button isn't found/clickable
+            self._recover_from_error()
+           
+        except Exception as e:
+            logging.error(f"Error clicking back button: {e}", exc_info=True)
+
+    def _recover_from_error(self):
+        """Recover from errors by refreshing the page and reinitializing"""
+        try:
+            self.driver.get(self.url)
+            self._initialize_form()
+        except Exception as e:
+            logging.error(f"Error recovering from error: {e}")
+
+    def _extract_and_save_results(self, search_params: Dict[str, str]) -> None:
+        """Extract results from the table and save them"""
+        try:
+            table = self.wait.until(EC.presence_of_element_located((By.ID, "ResultadoConsulta")))
+            rows = table.find_elements(By.TAG_NAME, "tr")[1:]  # Skip header
+            
+            results = []
+            for row in rows:
                 cols = row.find_elements(By.TAG_NAME, "td")
-                if cols:
-                    row_data = {}
-                    # Assuming the table has columns: Radicado, Fecha de Radicación, Despacho, Class, etc.
-                    if len(cols) >= 5:
-                        row_data['radicado'] = cols[0].text.strip()
-                        row_data['fecha_radicacion'] = cols[1].text.strip()
-                        row_data['despacho'] = cols[2].text.strip()
-                        row_data['clase'] = cols[3].text.strip()
-                        row_data['sujetos'] = cols[4].text.strip()
-                    table_data.append(row_data)
+                if len(cols) >= 5:
+                    results.append({
+                        'radicado': cols[0].text.strip(),
+                        'fecha_radicacion': cols[1].text.strip(),
+                        'despacho': cols[2].text.strip(),
+                        'clase': cols[3].text.strip(),
+                        'sujetos': cols[4].text.strip()
+                    })
             
-            # Add to results with the search parameters
-            result_entry = {
+            self.results.append({
                 'search_params': search_params,
                 'search_name': self.search_name,
-                'results': table_data
-            }
+                'results': results
+            })
             
-            self.results.append(result_entry)
-            
-            # Click back to try next combination
-            back_button = self.driver.find_element(By.ID, "btnNuevaConsulta")
-            back_button.click()
-            time.sleep(2)
+            self.save_results()  # Save after each successful search
             
         except Exception as e:
-            print(f"Error handling search results: {e}")
-            # Try to go back to search form
-            try:
-                self.driver.get(self.url)
-                #time.sleep(3)
-                self.initialize_search_form(max_retries=3)
-            except Exception as inner_e:
-                print(f"Error recovering from exception: {inner_e}")
-    
+            logging.error(f"Error extracting results: {e}")
+
     def save_results(self, filename="judicial_results.json"):
-        """
-        Save the scraped results to a JSON file
-        
-        Args:
-            filename (str): The name of the file to save results to
-        """
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump({
-                'search_name': self.search_name,
-                'total_results': len(self.results),
-                'results': self.results
-            }, f, ensure_ascii=False, indent=2)
-        
-        print(f"Results saved to {filename}")
-    
-    def run(self):
-        """Run the complete scraping process"""
+        """Save the scraped results to a JSON file"""
         try:
-            logging.info(f"Starting scraping for name: {self.search_name}")
-            
-            # Initialize the search form
-            self.initialize_search_form()
-            
-            # Start the recursive backtracking algorithm
-            logging.info("Starting backtracking algorithm to try all combinations...")
-            self.handle_select_chain()
-            
-            # Save results
-            logging.info("Saving results...")
-            self.save_results()
-            
-            logging.info(f"Scraping complete. Found {len(self.results)} results.")
-            
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'search_name': self.search_name,
+                    'total_results': len(self.results),
+                    'results': self.results
+                }, f, ensure_ascii=False, indent=2)
+            logging.info(f"Results saved to {filename}")
         except Exception as e:
-            logging.error(f"Error during scraping: {str(e)}", exc_info=True)
+            logging.error(f"Error saving results: {e}")
+
+    def run(self):
+        """Main execution method"""
+        try:
+            self.driver.get(self.url)
+            self._initialize_form()
+            
+            if self.target_department:
+                target_dept_index = self._find_and_select_target_department()
+                
+                if target_dept_index is not None:
+                    logging.info(f"Starting navigation from CITY level for selected department.")
+                    self._navigate_selection_chain(SelectionLevel.CITY, 1)
+                else:
+                    logging.error(f"Could not proceed: Target department '{self.target_department}' not found or failed to select.")
+                    return
+            else:
+                logging.info("Starting full navigation chain from DEPARTMENT level.")
+                self._navigate_selection_chain(SelectionLevel.DEPARTMENT, 1)
+                    
+            self.save_results()
+        except Exception as e:
+            logging.error(f"Error during execution: {e}")
         finally:
-            try:
-                if hasattr(self, 'driver'):
-                    logging.info("Closing WebDriver...")
-                    self.driver.quit()
-            except Exception as e:
-                logging.error(f"Error closing WebDriver: {str(e)}")
-    
+            self.close()
+
     def close(self):
+        """Close the browser and clean up resources"""
         if hasattr(self, 'driver'):
             try:
-                self.driver.title 
                 self.driver.quit()
-                logging.info("Browser closed successfully.")
+                logging.info("Browser closed successfully")
             except Exception as e:
-                logging.warning(f"Error closing browser: {str(e)}")
+                logging.error(f"Error closing browser: {e}")
 
 def main():
     """Main function to run the scraper"""
@@ -655,29 +449,29 @@ def main():
         search_name = input("Enter the name to search for: ")
         logging.info(f"User entered search name: {search_name}")
 
-        scraper = JudicialProcessScraper(search_name, headless=False)
+        target_dept_input = input("Enter target department (leave blank to scan all): ").strip()
+        target_department = target_dept_input if target_dept_input else None
+        
+        if target_department:
+            logging.info(f"Target department specified: {target_department}")
+        else:
+            logging.info("No target department specified, scanning all.")
+        
+        scraper = JudicialProcessScraper(search_name, target_department=target_department, headless=False)
         scraper.run()
 
     except KeyboardInterrupt:
-        logging.warning("Scraping interrupted by user.")
-        print("\nScraping interrupted by user.")
-
+        logging.warning("Scraping interrupted by user")
         if scraper and hasattr(scraper, 'results') and scraper.results:
-            logging.info("Saving partial results...")
             scraper.save_results()
 
     except Exception as e:
-        logging.critical(f"Unhandled exception in main: {str(e)}", exc_info=True)
-        print(f"An unexpected error occurred: {str(e)}")
+        logging.critical(f"Unhandled exception in main: {e}", exc_info=True)
+        print(f"An unexpected error occurred: {e}")
 
     finally:
         if scraper:
-            try:
-                scraper.close()
-            except Exception as e:
-                logging.warning(f"Error while closing scraper: {str(e)}")
-
+            scraper.close()
 
 if __name__ == "__main__":
     main()
-

@@ -41,7 +41,11 @@ geckodriver*
 msedgedriver*
 driver_downloads/
 
+# Judicial results file
+judicial_results.json/
+
 # Operating system files
 .DS_Store
 Thumbs.db
+
 
